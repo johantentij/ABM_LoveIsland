@@ -1,14 +1,35 @@
 """
-Agent-based model of a dating market.
+Agent-based model of a dating market (fixed-length relationships).
 
-Agents live on a toroidal (wrap-around) grid. Each step, single agents may
-move, then observe opposite-gender singles within an interaction radius,
-gathering *noisy* samples of a latent mutual compatibility. Each agent keeps a
-short memory of recent samples per candidate and runs a one-sample t-test to
-decide whether it is confident the true compatibility exceeds its personal
-threshold. It proposes to its most convincing candidate; a proposal succeeds
-only if it is mutual. Matched pairs leave the market for a while (longer when
-more compatible), then return single.
+Each step, agents act one at a time in random order.
+
+  * SINGLE agents sample their opposite-gender neighbours, then choose at most
+    one single neighbour to propose to via a logit rule over expected utilities.
+    A proposal is resolved immediately: the target evaluates the proposer with
+    its OWN t-test and accepts stochastically. On a match, both partners are
+    committed for a fixed `relationship_length` (default 10) steps.
+
+  * ENGAGED agents still observe their surroundings (their memory stays current)
+    but cannot move, propose, or handle proposals until the relationship ends.
+
+Decision model
+--------------
+For a candidate, a one-sided one-sample t-test on the agent's recent samples
+gives p = 1 - pvalue, the confidence that true compatibility exceeds the
+agent's threshold (its estimated probability of acceptance). The decision tree:
+
+        don't propose -> u = 0
+        propose       -> u = +1  (reciprocated)   with prob p
+                         u = -a  (rejected)        with prob 1 - p
+
+so the expected utility of proposing is  EU = p * (1 + a) - a, where `a` is the
+cost of rejection. The proposer logit-chooses among candidate EUs plus a
+no-proposal option (EU = 0) with personal rationality beta. When proposed to, a
+single target accepts with probability sigmoid(beta * EU_target). Handling a
+proposal is also scored: accepting adds +1 utility, rejecting adds 0.
+
+Populations are built with `add_agents(...)`; each call is recorded as a
+*strategy* with an id so groups can be compared.
 """
 
 from __future__ import annotations
@@ -24,82 +45,136 @@ class Agent:
         agent_id: int,
         pos: tuple[int, int],
         is_male: bool,
+        strategy_id: int,
         move_prob: float,
-        risk_aversion: float,
-        n_subjects: int,
-        memory_depth: int = 5,
-        relation_threshold: float = 0.8,
+        rejection_cost: float,
+        rationality: float,
+        relation_threshold: float,
+        memory_depth: int,
     ):
         self.model = model
         self.id = agent_id
         self.pos = pos
         self.is_male = is_male
+        self.strategy_id = strategy_id
+
         self.move_prob = move_prob
-        self.memory_depth = memory_depth
+        self.rejection_cost = rejection_cost      # `a`: rejection cost / standards
+        self.rationality = rationality            # logit inverse temperature beta
         self.relation_threshold = relation_threshold
+        self.memory_depth = memory_depth
 
-        # Significance level for the t-test. A more risk-averse agent demands
-        # stronger statistical evidence (a smaller alpha) before proposing.
-        self.alpha = max(1e-3, 1.0 - risk_aversion)
+        self.partner: int | None = None
+        self.engaged_until = 0                     # committed while t < engaged_until
+        self.utility = 0.0
 
-        # Step index at which this agent becomes single again. While
-        # model.t < engaged_until the agent is in a relationship.
-        self.engaged_until = 0
-
-        # Ring buffer of recent observations per potential partner, plus a count.
-        self.observations = np.zeros((n_subjects, memory_depth))
-        self.n_observations = np.zeros(n_subjects, dtype=int)
-
-        # Candidates found this step: list of (other_id, p_value).
-        self.candidates: list[tuple[int, float]] = []
+        self._buf: dict[int, np.ndarray] = {}
+        self._cnt: dict[int, int] = {}
 
     @property
     def is_single(self) -> bool:
         return self.model.t >= self.engaged_until
 
-    def observe(self, other_id: int) -> None:
-        """Record one fresh noisy sample of compatibility with `other_id`."""
-        slot = self.n_observations[other_id] % self.memory_depth
-        self.observations[other_id, slot] = self.model.sample_compatibility(self.id, other_id)
-        self.n_observations[other_id] += 1
+    # -- observation memory -------------------------------------------------
 
-    def evaluate_neighbours(self) -> None:
-        self.candidates = []
+    def observe(self, other_id: int, value: float) -> None:
+        if other_id not in self._buf:
+            self._buf[other_id] = np.zeros(self.memory_depth)
+            self._cnt[other_id] = 0
+        slot = self._cnt[other_id] % self.memory_depth
+        self._buf[other_id][slot] = value
+        self._cnt[other_id] += 1
+
+    def samples(self, other_id: int) -> np.ndarray:
+        n = min(self._cnt[other_id], self.memory_depth)
+        return self._buf[other_id][:n]
+
+    def observe_surroundings(self) -> None:
+        """Engaged agents keep sensing the environment, but take no action."""
+        for other_id in self.model.neighbours(self.id):
+            if self.model.subjects[other_id].is_male != self.is_male:
+                self.observe(other_id, self.model.sample_compatibility(self.id, other_id))
+
+    # -- expected utility ---------------------------------------------------
+
+    def _expected_utility(self, other_id: int) -> float | None:
+        """EU of being matched with other_id, or None if too few samples."""
+        if other_id not in self._cnt:
+            return None
+        s = self.samples(other_id)
+        if len(s) < 2:
+            return None
+        res = ttest_1samp(s, self.relation_threshold, alternative="greater")
+        if not np.isfinite(res.pvalue):
+            return None
+        p = 1.0 - res.pvalue
+        return p * (1.0 + self.rejection_cost) - self.rejection_cost
+
+    # -- turn (single agents only) ------------------------------------------
+
+    def act(self) -> None:
+        self.partner = None                        # drop any finished partnership
+        target = self._choose_target()
+        if target is None:
+            return                                 # utility += 0
+
+        other = self.model.subjects[target]
+        if other.consider_proposal(self.id):
+            until = self.model.t + self.model.relationship_length + self.model.rng.integers(-2, 3)
+            self.partner = target
+            other.partner = self.id
+            self.engaged_until = until
+            other.engaged_until = until
+            self.utility += 1.0                    # reciprocated
+        else:
+            self.utility -= self.rejection_cost    # rejected
+
+    def _choose_target(self) -> int | None:
+        target_ids: list[int | None] = []
+        utilities: list[float] = []
+
         for other_id in self.model.neighbours(self.id):
             other = self.model.subjects[other_id]
-            if other.is_male == self.is_male or not other.is_single:
+            if other.is_male == self.is_male:
                 continue
 
-            self.observe(other_id)
+            # interact with every opposite-gender neighbour
+            self.observe(other_id, self.model.sample_compatibility(self.id, other_id))
 
-            n = min(self.n_observations[other_id], self.memory_depth)
-            if n < 2:
-                continue  # need >= 2 samples to estimate a variance
+            # may only propose to single agents
+            if not other.is_single:
+                continue
 
-            samples = self.observations[other_id, :n]
-            result = ttest_1samp(samples, self.relation_threshold, alternative="greater")
+            eu = self._expected_utility(other_id)
+            if eu is None:
+                continue
+            target_ids.append(other_id)
+            utilities.append(eu)
 
-            # Small p-value => strong evidence that true compatibility exceeds
-            # the threshold. Keep candidates that clear this agent's alpha.
-            if np.isfinite(result.pvalue) and result.pvalue <= self.alpha:
-                self.candidates.append((other_id, float(result.pvalue)))
+        target_ids.append(None)
+        utilities.append(0.0)
 
-    def propose(self) -> None:
-        if not self.candidates:
-            return
-        # Most convincing candidate = smallest p-value.
-        best_id, _ = min(self.candidates, key=lambda c: c[1])
-        engaged_until = self.model.subjects[best_id].handle_proposal(self.id)
-        if engaged_until:  # 0 means the proposal was declined
-            self.engaged_until = engaged_until
+        z = self.rationality * np.asarray(utilities)
+        z -= z.max()
+        weights = np.exp(z)
+        probs = weights / weights.sum()
+        choice = self.model.rng.choice(len(target_ids), p=probs)
+        t = target_ids[choice]
+        return None if t is None else int(t)
 
-    def handle_proposal(self, proposer_id: int) -> int:
-        # Accept only if the proposer is mutually one of my candidates.
-        if any(other_id == proposer_id for other_id, _ in self.candidates):
-            duration = self.model.relationship_length(self.id, proposer_id)
-            self.engaged_until = self.model.t + duration
-            return self.engaged_until
-        return 0
+    def consider_proposal(self, proposer_id: int) -> bool:
+        """Accept with probability sigmoid(beta * EU); accept -> +1, reject -> 0."""
+        if not self.is_single:
+            return False                           # engaged agents do not respond
+        self.observe(proposer_id, self.model.sample_compatibility(self.id, proposer_id))
+        eu = self._expected_utility(proposer_id)
+        if eu is None:
+            return False
+        p_accept = 1.0 / (1.0 + np.exp(-self.rationality * eu))
+        if self.model.rng.random() < p_accept:
+            self.utility += 1.0
+            return True
+        return False
 
     def move(self) -> None:
         if self.model.rng.random() > self.move_prob:
@@ -119,88 +194,115 @@ class DatingMarket:
     def __init__(
         self,
         n_grid: int,
-        n_subjects: int,
-        gender_balance: float = 0.5,
-        move_prob: float = 0.5,
-        risk_aversion: float = 0.99,
         interaction_std: float = 0.5,
         interaction_radius: int = 5,
-        memory_depth: int = 5,
-        relation_threshold: float = 0.8,
-        max_relationship_length: int = 10,
+        relationship_length: int = 10,
         seed: int | None = None,
     ):
-        if n_subjects > n_grid * n_grid:
-            raise ValueError("more subjects than grid cells")
-
         self.rng = np.random.default_rng(seed)
         self.n_grid = n_grid
-        self.n_subjects = n_subjects
         self.interaction_std = interaction_std
         self.interaction_radius = interaction_radius
-        self.max_relationship_length = max_relationship_length
-        self.t = 0  # global step clock
-
-        self.n_males = int(round(gender_balance * n_subjects))
-        self.n_females = n_subjects - self.n_males
-
-        # Latent mutual compatibility for each (male, female) pair, in [0, 1].
-        self.compatibility = self.rng.random((self.n_males, self.n_females))
+        self.relationship_length = relationship_length
+        self.t = 0
 
         self.grid = np.full((n_grid, n_grid), self.EMPTY, dtype=np.int32)
         self.subjects: list[Agent] = []
 
-        # Place everyone on distinct random cells. ids 0..n_males-1 are male,
-        # the remaining ids are female.
-        free_cells = [(r, c) for r in range(n_grid) for c in range(n_grid)]
-        self.rng.shuffle(free_cells)
-        for agent_id in range(n_subjects):
-            pos = free_cells[agent_id]
-            is_male = agent_id < self.n_males
-            self.grid[pos] = agent_id
-            self.subjects.append(
-                Agent(self, agent_id, pos, is_male, move_prob, risk_aversion,
-                      n_subjects, memory_depth, relation_threshold)
+        self._compat: dict[tuple[int, int], float] = {}
+
+        self.strategies: dict[int, dict] = {}
+        self.history: list[dict] = []
+        self.strategy_history: dict[int, list[dict]] = {}
+
+    # -- population building -------------------------------------------------
+
+    def add_agents(
+        self,
+        n: int,
+        *,
+        gender_balance: float = 0.5,
+        move_prob: float = 0.5,
+        rejection_cost: float = 0.5,
+        rationality: float = 5.0,
+        relation_threshold: float = 0.8,
+        memory_depth: int = 10,
+        label: str | None = None,
+    ) -> int:
+        """Add `n` agents sharing one strategy. Returns the strategy id."""
+        strategy_id = len(self.strategies)
+        self.strategies[strategy_id] = {
+            "label": label or f"strategy_{strategy_id}",
+            "n": n,
+            "gender_balance": gender_balance,
+            "move_prob": move_prob,
+            "rejection_cost": rejection_cost,
+            "rationality": rationality,
+            "relation_threshold": relation_threshold,
+            "memory_depth": memory_depth,
+        }
+        self.strategy_history[strategy_id] = []
+
+        n_male = int(round(gender_balance * n))
+        genders = [True] * n_male + [False] * (n - n_male)
+        self.rng.shuffle(genders)
+
+        for is_male in genders:
+            pos = self._random_free_cell()
+            agent_id = len(self.subjects)
+            agent = Agent(
+                self, agent_id, pos, is_male, strategy_id,
+                move_prob, rejection_cost, rationality,
+                relation_threshold, memory_depth,
             )
+            self.grid[pos] = agent_id
+            self.subjects.append(agent)
 
-    # -- compatibility-matrix helpers --------------------------------------
+        return strategy_id
 
-    def _male_female_index(self, id1: int, id2: int) -> tuple[int, int]:
-        """Map an (agent, agent) pair to (male_row, female_col)."""
-        if self.subjects[id1].is_male:
-            male_id, female_id = id1, id2
+    def _random_free_cell(self) -> tuple[int, int]:
+        free = np.argwhere(self.grid == self.EMPTY)
+        if len(free) == 0:
+            raise RuntimeError("grid is full; use a larger n_grid")
+        r, c = free[self.rng.integers(len(free))]
+        return (int(r), int(c))
+
+    # -- compatibility -------------------------------------------------------
+
+    def compatibility(self, id_a: int, id_b: int) -> float:
+        if self.subjects[id_a].is_male:
+            key = (id_a, id_b)
         else:
-            male_id, female_id = id2, id1
-        return male_id, female_id - self.n_males
+            key = (id_b, id_a)
+        val = self._compat.get(key)
+        if val is None:
+            val = float(self.rng.random())
+            self._compat[key] = val
+        return val
 
     def sample_compatibility(self, observer_id: int, other_id: int) -> float:
-        m, f = self._male_female_index(observer_id, other_id)
-        return self.compatibility[m, f] + self.rng.normal(0.0, self.interaction_std)
+        return self.compatibility(observer_id, other_id) + self.rng.normal(0.0, self.interaction_std)
 
-    def relationship_length(self, id1: int, id2: int) -> int:
-        m, f = self._male_female_index(id1, id2)
-        return max(1, round(self.max_relationship_length * self.compatibility[m, f]))
-
-    # -- spatial queries ---------------------------------------------------
+    # -- spatial queries -----------------------------------------------------
 
     def neighbours(self, agent_id: int) -> list[int]:
         r0, c0 = self.subjects[agent_id].pos
         r = self.interaction_radius
-        result = []
+        out = []
         for dr in range(-r, r + 1):
             rr = (r0 + dr) % self.n_grid
             for dc in range(-r, r + 1):
                 cc = (c0 + dc) % self.n_grid
                 if (rr, cc) == (r0, c0):
                     continue
-                occupant = self.grid[rr, cc]
-                if occupant != self.EMPTY:
-                    result.append(int(occupant))
-        return result
+                occ = self.grid[rr, cc]
+                if occ != self.EMPTY:
+                    out.append(int(occ))
+        return out
 
     def movement_options(self, agent_id: int) -> list[tuple[int, int]]:
         r0, c0 = self.subjects[agent_id].pos
-        options = []
+        out = []
         for dr in (-1, 0, 1):
             rr = (r0 + dr) % self.n_grid
             for dc in (-1, 0, 1):
@@ -208,51 +310,91 @@ class DatingMarket:
                 if (rr, cc) == (r0, c0):
                     continue
                 if self.grid[rr, cc] == self.EMPTY:
-                    options.append((rr, cc))
-        return options
+                    out.append((rr, cc))
+        return out
 
-    # -- simulation --------------------------------------------------------
+    # -- simulation ----------------------------------------------------------
 
     def step(self) -> None:
-        for agent_id in self.rng.permutation(self.n_subjects):
-            agent = self.subjects[agent_id]
-            if agent.is_single:
-                agent.move()
-                agent.evaluate_neighbours()
-                agent.propose()
+        n = len(self.subjects)
+        for i in self.rng.permutation(n):
+            a = self.subjects[int(i)]
+            if a.is_single:
+                a.act()
+            else:
+                a.observe_surroundings()           # engaged: sense but don't act
+        # only single agents may relocate
+        for i in self.rng.permutation(n):
+            a = self.subjects[int(i)]
+            if a.is_single:
+                a.move()
         self.t += 1
 
-    def stats(self) -> dict[str, int]:
-        single = sum(a.is_single for a in self.subjects)
+    # -- statistics ----------------------------------------------------------
+
+    def agent_quality(self, agent: Agent) -> float:
+        if agent.is_single:
+            return 0.0
+        return self.compatibility(agent.id, agent.partner)
+
+    def relationship_quality(self) -> float:
+        if not self.subjects:
+            return 0.0
+        return float(np.mean([self.agent_quality(a) for a in self.subjects]))
+
+    def snapshot(self) -> dict:
+        matched = sum(not a.is_single for a in self.subjects)
+        n = len(self.subjects)
         return {
             "t": self.t,
-            "single": single,
-            "engaged": self.n_subjects - single,
-            "couples": (self.n_subjects - single) // 2,
+            "matched": matched,
+            "single": n - matched,
+            "couples": matched // 2,
+            "mean_quality": self.relationship_quality(),
+            "mean_utility": float(np.mean([a.utility for a in self.subjects])) if n else 0.0,
         }
 
-    def run(self, n_steps: int) -> list[dict[str, int]]:
-        history = [self.stats()]
+    def strategy_stats(self) -> dict[int, dict]:
+        out = {}
+        for sid, params in self.strategies.items():
+            members = [a for a in self.subjects if a.strategy_id == sid]
+            if not members:
+                continue
+            out[sid] = {
+                "label": params["label"],
+                "n": len(members),
+                "matched_fraction": float(np.mean([not a.is_single for a in members])),
+                "mean_quality": float(np.mean([self.agent_quality(a) for a in members])),
+                "mean_utility": float(np.mean([a.utility for a in members])),
+            }
+        return out
+
+    def _record(self) -> None:
+        self.history.append(self.snapshot())
+        for sid, stats in self.strategy_stats().items():
+            self.strategy_history[sid].append({"t": self.t, **stats})
+
+    def run(self, n_steps: int) -> list[dict]:
+        if not self.history:
+            self._record()
         for _ in range(n_steps):
             self.step()
-            history.append(self.stats())
-        return history
+            self._record()
+        return self.history
 
 
 if __name__ == "__main__":
-    market = DatingMarket(
-        n_grid=40,
-        n_subjects=200,
-        move_prob=0.6,
-        risk_aversion=0.99,
-        interaction_radius=4,
-        seed=0,
-    )
-    history = market.run(80)
-    for snapshot in history[::10]:
+    market = DatingMarket(n_grid=40, interaction_radius=4, interaction_std=0.5,
+                          relationship_length=10, seed=0)
+    market.add_agents(100, rejection_cost=1.5, rationality=6.0, label="cautious")
+    market.add_agents(100, rejection_cost=0.2, rationality=6.0, label="bold")
+    market.run(120)
+
+    print("Final per-strategy statistics:")
+    for sid, s in market.strategy_stats().items():
         print(
-            f"t={snapshot['t']:>3}  "
-            f"single={snapshot['single']:>3}  "
-            f"engaged={snapshot['engaged']:>3}  "
-            f"couples={snapshot['couples']:>3}"
+            f"  [{s['label']:>8}] n={s['n']:>3}  "
+            f"matched={s['matched_fraction']:.2f}  "
+            f"quality={s['mean_quality']:.3f}  "
+            f"cum.utility={s['mean_utility']:.1f}"
         )
