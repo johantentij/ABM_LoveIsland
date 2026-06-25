@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import numpy as np
 import ctypes
+import scipy.special.cython_special as cysp
 from numba import njit, int64, int32
 from numba.types import ListType, UniTuple
 from numba.extending import get_cython_function_address
 
 # Grab the stable C address for the Student's T CDF function directly
-addr = get_cython_function_address("scipy.special.cython_special", "stdtr")
+stdtr_capsule_name = next((k for k in cysp.__pyx_capi__.keys() if "stdtr" in k), None)
+addr = get_cython_function_address("scipy.special.cython_special", stdtr_capsule_name)
 
 # Define the explicit C-signature: double stdtr(double, double)
 stdtr_sig = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double, ctypes.c_double)
@@ -139,6 +141,8 @@ class DatingMarket:
         self.history: list[dict] = []
         self.strategy_history: dict[int, list[dict]] = {}
 
+        self.rej_cost_matrix_list: list[float] = []
+
     # -- population building -------------------------------------------------
 
     def add_agents(
@@ -153,6 +157,7 @@ class DatingMarket:
         memory_depth: int = 10,
         agent_rational: str = 'freq',
         label: str | None = None,
+        decay_rate_rej = 0.8
     ) -> int:
         """Add `n` agents sharing one strategy. Returns the strategy id."""
         strategy_id = len(self.strategies)
@@ -166,8 +171,11 @@ class DatingMarket:
             "relation_threshold": relation_threshold,
             "memory_depth": memory_depth,
             "agent_rational": agent_rational,
+            "decay_rate_rej": decay_rate_rej
         }
         self.strategy_history[strategy_id] = []
+
+        # self.rej_cost_matrix_list[strategy_id] = np.full(shape=(n), fill_value=rejection_cost, dtype=np.float64)
 
         n_male = int(round(gender_balance * n))
         genders = [True] * n_male + [False] * (n - n_male)
@@ -179,10 +187,11 @@ class DatingMarket:
             agent = Agent(
                 self, agent_id, pos, is_male, strategy_id,
                 move_prob, rejection_cost, rationality,
-                relation_threshold, memory_depth, agent_rational=agent_rational,
+                relation_threshold, memory_depth, agent_rational=agent_rational,decay_rate_rej=decay_rate_rej
             )
             self.grid[pos] = agent_id
             self.subjects.append(agent)
+            self.rej_cost_matrix_list.append(rejection_cost)
 
         return strategy_id
 
@@ -323,7 +332,8 @@ class Agent:
         rationality: float,
         relation_threshold: float,
         memory_depth: int,
-        agent_rational: str
+        agent_rational: str,
+        decay_rate_rej: float
     ):
         self.model = model
         self.id = agent_id
@@ -344,6 +354,7 @@ class Agent:
 
         self._buf: dict[int, np.ndarray] = {}
         self._cnt: dict[int, int] = {}
+        self.decay_rate_rej = decay_rate_rej
 
     @property
     def is_single(self) -> bool:
@@ -378,6 +389,7 @@ class Agent:
 
     def _expected_utility(self, other_id: int) -> float | None:
         """EU of being matched with other_id, or None if too few samples."""
+        a = self.model.rej_cost_matrix_list[self.id]
         if other_id not in self._cnt:
             return None
         s = self.samples(other_id)
@@ -386,14 +398,14 @@ class Agent:
 
         #Mean field strategy
         if self.agent_rational == "mean":
-            return 2*self.rejection_cost if np.mean(s) > self.rejection_cost else -self.rejection_cost
+            return 2*a if np.mean(s) > self.relation_threshold else -a
 
         # res = ttest_1samp(s, self.relation_threshold, alternative="greater")
         _, pvalue = t_test(s, self.relation_threshold)
         if not np.isfinite(pvalue):
             return None
         p = 1.0 - pvalue
-        return p * (2*self.rejection_cost + self.rejection_cost) - self.rejection_cost
+        return p * (2*a + a) - a
 
     # -- turn (single agents only) ------------------------------------------
 
@@ -463,7 +475,12 @@ class Agent:
         p_accept = 1.0 / (1.0 + np.exp(-self.rationality * eu))
         if self.model.rng.random() < p_accept:
             self.utility += 1.0
+            self.model.rej_cost_matrix_list[proposer_id] = self.model.subjects[proposer_id].rejection_cost
+            self.model.rej_cost_matrix_list[self.id] = self.model.subjects[self.id].rejection_cost
             return True
+        else:
+            self.model.rej_cost_matrix_list[proposer_id] *= self.decay_rate_rej
+            # print(self.model.rej_cost_matrix_list[self.strategy_id][proposer_id % (self.strategy_id+1)])
         return False
 
     def move(self) -> None:
@@ -483,7 +500,7 @@ if __name__ == "__main__":
     market = DatingMarket(n_grid=40, interaction_radius=4, interaction_std=0.5,
                           relationship_length=10, seed=0)
     market.add_agents(100, rejection_cost=1.5, rationality=6.0, label="cautious")#, agent_rational="mean")
-    market.add_agents(100, rejection_cost=0.2, rationality=6.0, label="bold", agent_rational="mean")
+    market.add_agents(100, rejection_cost=0.2, rationality=6.0, label="bold")
     market.add_agents(100, rejection_cost=0.2, rationality=.0, label="random")#, agent_rational="mean")
     market.run(120)
 
@@ -495,3 +512,6 @@ if __name__ == "__main__":
             f"quality={s['mean_quality']:.3f}  "
             f"cum.utility={s['mean_utility']:.1f}"
         )
+    print(market.rej_cost_matrix_list[0:100])
+    print(market.rej_cost_matrix_list[100:200])
+    print(market.rej_cost_matrix_list[200:300])
