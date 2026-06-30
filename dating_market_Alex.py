@@ -157,7 +157,7 @@ class DatingMarket:
         memory_depth: int = 10,
         agent_rational: str = 'freq',
         label: str | None = None,
-        decay_rate_rej = 0.8
+        decay_rate_rej = 1
     ) -> int:
         """Add `n` agents sharing one strategy. Returns the strategy id."""
         strategy_id = len(self.strategies)
@@ -405,7 +405,7 @@ class Agent:
         if not np.isfinite(pvalue):
             return None
         p = 1.0 - pvalue
-        return p * (2*a + a) - a
+        return p - (1 - p) * a
 
     # -- turn (single agents only) ------------------------------------------
 
